@@ -117,3 +117,58 @@ Browser runs used Playwright `1.64.1` (installed with `--no-save` outside the pr
 
 - No hosted Supabase link, deployment, remote database, or paid model call was performed.
 - `LIVE_GITHUB=1` browser path was not re-run in this iteration (unchanged from the prior validation); the offline pinned fixture was used throughout.
+
+---
+
+## Review fixes — local validation (31 October 2026, Melbourne)
+
+Five review findings on `feat/local-persistence` were addressed. A new migration
+(`20261031000002_per_run_evidence_and_drafts.sql`) rebinds evidence to each run and
+adds a durable draft table; both migrations apply cleanly in order to a disposable
+database (verified: 5 tables).
+
+### Page reload vs actual server restart
+
+These are distinct and are now validated separately:
+
+- **Page reload** — the browser tab is refreshed; the Node server keeps running and
+  its in-memory analysis token still exists. Verified in the persistence browser
+  walkthrough (`page.reload()` then reopen from the saved list).
+- **Actual server restart** — the Node process is stopped and started again, so all
+  in-memory state (snapshot cache and analysis tokens) is lost. Verified with two
+  **separate OS processes** sharing only the database: process A prepared an analysis
+  (persisting a durable `analysis_draft`) then exited; a brand-new process B
+  completed the **first** save using only the `draftId`, and the teacher's answer
+  entered before the first save was preserved. This is the restart-safe path in
+  Finding 4.
+
+### Findings and checks
+
+| # | Finding | Fix | Check | Result |
+| --- | --- | --- | --- | --- |
+| 1 | Older runs lost their evidence when a new run was saved (evidence was 1:1 with the interview and upserted). | Evidence is now 1:1 with `analysis_run`, written once inside the run's transaction and never mutated. Opening/exporting a run returns that run's own repository, commit, files, focus and history. | `test:db` "re-analysis with CHANGED material keeps each run's own evidence" saves run 1 (two files, focus/history one), then run 2 (one file, focus/history two); reopening each run shows its own files and inputs, independent and unchanged. | **Passed** |
+| 2 | A slow save response could overwrite edits made during the request. | While a save is in flight the UI locks the title, review, all question/answer/verification fields, the run selector, New interview, refresh and the saved-list rows. | Persistence browser walkthrough delays `/api/save` by 1.2 s and asserts the answer field, title and New interview are disabled while the state shows *Saving…*, re-enabled afterwards, and the in-flight edit is the value persisted. | **Passed** |
+| 3 | Destructive test SQL trusted `DATABASE_URL` without checking the target. | `tests/helpers/test-db-guard.mjs` `assertDisposableTestDb()` parses the URL and requires host ∈ {127.0.0.1, localhost, ::1}, port = 54342, database = `l2ai_assess_test` before any TRUNCATE/DROP. Called by `db.test.mjs` (before + each test) and `browser-persistence.mjs`. | `test:db` "assertDisposableTestDb rejects dev/remote/wrong targets" asserts the dev database (`/postgres`), the Class Intake port (54322), a remote host and an empty URL are all rejected, and the configured test target is accepted. | **Passed** |
+| 4 | First save was impossible after token expiry or restart (analysis lived only in memory). | `/api/analyse` persists a server-authoritative `analysis_draft` and returns its `draftId`; `/api/save` resolves the authoritative analysis from the in-memory token **or** the durable draft, then deletes the draft on promotion. | `test:db` "durable draft lets the FIRST save proceed after token expiry/restart" (in-process) and the two-process restart proof above. Questions are preserved, not regenerated; the pre-save answer is kept. | **Passed** |
+| 5 | Response question ids were trusted from the client and original text came from the browser. | `reconcileResponses()` validates every response `questionId` against the target run's authoritative analysis, rejects unknown/duplicate ids (`ValidationError` → HTTP 400), and derives `original_question` from the authoritative analysis. | `test:db` "unknown and duplicate response question ids are rejected" plus the HTTP case (bad qid → 400). | **Passed** |
+
+### Commands run
+
+```bash
+npm test                      # 5/5 core tests pass (no DB)
+npm run test:db               # 12/12 persistence tests pass (disposable l2ai_assess_test)
+npm run test:ui               # core browser walkthrough: PASS
+node --env-file-if-exists=.env.test tests/browser-persistence.mjs   # persistence walkthrough: PASS
+```
+
+Browser runs used Playwright `1.64.1` installed outside the project (`--no-save`,
+referenced via a temporary symlink removed afterwards) and the cached official
+Chrome for Testing build. No assessed-repository code or dependencies were installed
+or executed. All changes are local and uncommitted.
+
+### Not run / unverified
+
+- No hosted Supabase, deployment, remote database, or paid model call was performed.
+- `LIVE_GITHUB=1` was not re-run this round; the offline pinned fixture was used.
+- The two-process restart proof used a scratch script that was deleted after the run;
+  the restart-safe path is also covered in-process by the `test:db` draft test.

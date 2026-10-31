@@ -4,13 +4,15 @@ import {randomUUID} from 'node:crypto';
 import {resolveRepository,readSelected} from './lib/github.mjs';
 import {analyse,estimate} from './lib/model.mjs';
 import {LIMITS} from './lib/evidence.mjs';
-import {saveInterview,listInterviews,openInterview,ping,ConflictError,NotFoundError} from './lib/db.mjs';
+import {saveInterview,listInterviews,openInterview,ping,createDraft,getDraft,pruneDrafts,ConflictError,NotFoundError,ValidationError} from './lib/db.mjs';
 
 const snapshots=new Map();
 // Server-authoritative analysis results. /api/analyse mints a token here; /api/save
 // reads evidence, validated analysis and provenance from this cache instead of
 // trusting browser-submitted source text or model metadata. Entries expire with
-// the snapshots they were derived from.
+// the snapshots they were derived from. When persistence is enabled the same
+// payload is ALSO written to a durable analysis_draft so the first save survives
+// token expiry or an application restart (Finding 4).
 const analyses=new Map();
 const DB_ENABLED=!!process.env.DATABASE_URL;
 
@@ -22,7 +24,7 @@ function withQids(analysis){
 
 export function createApp(){return http.createServer(async(req,res)=>{
  const reply=(status,data)=>{res.writeHead(status,{'Content-Type':'application/json','Cache-Control':'no-store','X-Content-Type-Options':'nosniff'});res.end(JSON.stringify(data));};
- const fail=(e)=>{const status=e instanceof ConflictError?409:e instanceof NotFoundError?404:400;reply(status,{error:e.message||'Request failed'});};
+ const fail=(e)=>{const status=e instanceof ConflictError?409:e instanceof NotFoundError?404:e instanceof ValidationError?400:400;reply(status,{error:e.message||'Request failed'});};
  try{
  const host=req.headers.host;if(!/^127\.0\.0\.1:\d+$/.test(host||''))return reply(403,{error:'Local access only'});
  if(req.method==='GET'){
@@ -61,13 +63,20 @@ export function createApp(){return http.createServer(async(req,res)=>{
  const evidence={repository:snapshot.repository,commitSha:snapshot.sha,source:snapshot.source,retrievedAt:snapshot.retrievedAt,files,unread,excludedEntries:snapshot.excludedEntries};
  const runInputs={focus:body.focus,history:body.history,paths:[...body.paths]};
  analyses.set(analysisToken,{evidence,analysis,model:result.model,runInputs,expires:Date.now()+1800000});
- reply(200,{schemaVersion:'l2ai-assess.v1',analysisToken,...evidence,focus:body.focus,history:body.history,analysis,model:result.model});
+ // Durable draft so the FIRST save works after token expiry / restart (Finding 4).
+ // Evidence and analysis stay server-authoritative; the draft is the server's own
+ // copy, not browser-submitted. Pruned opportunistically.
+ let draftId=null;
+ if(DB_ENABLED){try{pruneDrafts().catch(()=>{});draftId=await createDraft({evidence,analysis,runInputs,model:result.model});}catch(e){draftId=null;}}
+ reply(200,{schemaVersion:'l2ai-assess.v1',analysisToken,draftId,...evidence,focus:body.focus,history:body.history,analysis,model:result.model});
  }catch(e){fail(e);}
  });}
 
-// Save handler: evidence/analysis/provenance are taken from the authoritative
-// analysis cache (not the browser). Only teacher-editable fields are accepted from
-// the client. Missing/expired token on a new run is a visible error.
+// Save handler: evidence/analysis/provenance are taken from the server's own
+// authoritative source — the in-memory analysis cache OR the durable draft
+// (restart-safe), never from the browser. Only teacher-editable fields are
+// accepted from the client. Response question ids are validated against the
+// authoritative analysis inside the transaction (lib/db.mjs reconcileResponses).
 async function handleSave(body,reply){
  if(!DB_ENABLED)throw Error('Persistence is not configured (set DATABASE_URL).');
  const title=body.title;
@@ -81,24 +90,39 @@ async function handleSave(body,reply){
   expectedVersion:Number.isInteger(body.expectedVersion)?body.expectedVersion:undefined,
   idempotencyKey:typeof body.idempotencyKey==='string'?body.idempotencyKey:undefined,
   title,focus:body.focus,history:body.history??'',teacherReview:body.teacherReview??'',
-  responses:validateResponses(body.responses)
+  responses:shapeResponses(body.responses)
  };
 
+ // Resolve the authoritative prepared analysis for a NEW run from either the
+ // in-memory token or the durable draft (so first save survives restart).
+ let auth=null;
  if(body.analysisToken){
-  const auth=analyses.get(body.analysisToken);
-  if(!auth||auth.expires<Date.now())throw Error('Analysis expired; re-run Prepare interview before saving a new analysis.');
+  const mem=analyses.get(body.analysisToken);
+  if(mem&&mem.expires>=Date.now())auth=mem;
+ }
+ if(!auth&&typeof body.draftId==='string'){
+  const draft=await getDraft(body.draftId);
+  if(draft)auth={evidence:draft.evidence,analysis:draft.analysis,runInputs:draft.runInputs,model:draft.model};
+ }
+
+ if(auth){
   payload.evidence=auth.evidence;
   payload.run={analysis:auth.analysis,runInputs:auth.runInputs,model:auth.model};
+  payload.draftId=typeof body.draftId==='string'?body.draftId:undefined;
+ }else if(body.analysisToken||body.draftId){
+  throw Error('Analysis draft expired or not found; re-run Prepare interview before saving a new analysis.');
  }else{
   // Saving edits to an already-persisted run without re-analysing.
   payload.runId=typeof body.runId==='string'?body.runId:undefined;
-  if(!payload.interviewId)throw Error('Nothing to save: provide an analysisToken (new run) or an existing interviewId.');
+  if(!payload.interviewId)throw Error('Nothing to save: provide an analysisToken/draftId (new run) or an existing interviewId.');
  }
  const saved=await saveInterview(payload);
  reply(200,saved);
 }
 
-function validateResponses(responses){
+// Basic shape/length validation only. Authoritative question-id validation and
+// original_question derivation happen in lib/db.mjs against the target run.
+function shapeResponses(responses){
  if(responses===undefined)return undefined;
  if(!Array.isArray(responses)||responses.length>50)throw Error('Invalid responses.');
  return responses.map(r=>{
@@ -106,7 +130,6 @@ function validateResponses(responses){
   const field=(v,max)=>{if(v===undefined||v===null)return '';if(typeof v!=='string'||v.length>max)throw Error('Response field too long.');return v;};
   return {
    questionId:r.questionId,
-   originalQuestion:field(r.originalQuestion,6000),
    editedQuestion:field(r.editedQuestion,6000),
    studentSelfReport:field(r.studentSelfReport,12000),
    teacherVerification:field(r.teacherVerification,12000)

@@ -11,12 +11,15 @@
 import assert from 'node:assert/strict';
 import {createApp} from '../server.mjs';
 import {closePool,getPool} from '../lib/db.mjs';
+import {assertDisposableTestDb} from './helpers/test-db-guard.mjs';
 
 assert.ok(process.env.DATABASE_URL,'DATABASE_URL required for the persistence walkthrough.');
+// Finding 3: refuse to truncate anything but the disposable test database.
+assertDisposableTestDb();
 const {chromium}=await import(process.env.PLAYWRIGHT_MODULE||'playwright');
 
-// Start from a clean slate in whichever database DATABASE_URL points at.
-await getPool().query('truncate interview cascade');
+// Start from a clean slate in the disposable test database.
+await getPool().query('truncate interview, analysis_draft cascade');
 
 const app=createApp();await new Promise(r=>app.listen(0,'127.0.0.1',r));
 const base='http://127.0.0.1:'+app.address().port;
@@ -46,6 +49,25 @@ try{
  // Appears in the saved list.
  await page.waitForFunction(()=>[...document.querySelectorAll('#interviews .ilist-item')].some(e=>e.textContent.includes('Playwright save test')),{},{timeout:10000});
 
+ // Finding 2: a DELAYED save response must not let a mid-request edit be
+ // overwritten. While the save is in flight, editing and navigation are locked.
+ // Delay the next /api/save response and assert the fields are disabled during it.
+ await page.locator('#a0').fill('Edit before the delayed save begins.');
+ await page.waitForFunction(()=>document.getElementById('save-state').textContent==='Unsaved');
+ await page.route('**/api/save',async route=>{await new Promise(r=>setTimeout(r,1200));await route.continue();});
+ const saveClick=page.getByRole('button',{name:'Save interview',exact:true}).click();
+ // During the in-flight save the answer field, title, run selector and New
+ // interview are all disabled, so no edit can be made that the response discards.
+ await page.waitForFunction(()=>document.getElementById('save-state').textContent==='Saving…',{},{timeout:5000});
+ assert.equal(await page.locator('#a0').isDisabled(),true,'answer field locked during save');
+ assert.equal(await page.locator('#title').isDisabled(),true,'title locked during save');
+ assert.equal(await page.locator('#new-interview').isDisabled(),true,'navigation locked during save');
+ await saveClick;
+ await page.unroute('**/api/save');
+ await page.waitForFunction(()=>document.getElementById('save-state').textContent==='Saved',{},{timeout:10000});
+ assert.equal(await page.locator('#a0').isDisabled(),false,'fields re-enabled after save');
+ assert.equal(await page.locator('#a0').inputValue(),'Edit before the delayed save begins.','the saved edit is preserved');
+
  // Simulate a RESTART: reload the page (clears in-memory snapshot + record).
  await page.reload();
  await page.waitForFunction(()=>document.getElementById('db-state').textContent.includes('connected'),{},{timeout:10000});
@@ -56,7 +78,7 @@ try{
  await page.locator('#interview').waitFor();
  await page.waitForFunction(()=>document.getElementById('save-state').textContent==='Saved',{},{timeout:10000});
  assert.equal(await page.locator('#title').inputValue(),'Playwright save test');
- assert.equal(await page.locator('#a0').inputValue(),'Synthetic answer for q1 — rehearsal only.','answer survived restart+reopen');
+ assert.equal(await page.locator('#a0').inputValue(),'Edit before the delayed save begins.','answer survived restart+reopen');
  assert.match(await page.locator('#v0').inputValue(),/runtime unverified/);
 
  // Continue editing -> state becomes Unsaved; re-save -> Saved.
@@ -71,7 +93,7 @@ try{
  const current=await (await fetch(base+'/api/open',{method:'POST',headers:{Origin:base,'Content-Type':'application/json'},body:JSON.stringify({interviewId:(await (await fetch(base+'/api/interviews',{method:'POST',headers:{Origin:base,'Content-Type':'application/json'},body:'{}'})).json()).interviews.find(i=>i.title==='Playwright save test').id})})).json();
  const snap2=await (await fetch(base+'/api/resolve',{method:'POST',headers:{Origin:base,'Content-Type':'application/json'},body:JSON.stringify({url:'https://github.com/GongqiLinVU/milestoneproject',demo:true})})).json();
  const prep2=await (await fetch(base+'/api/analyse',{method:'POST',headers:{Origin:base,'Content-Type':'application/json'},body:JSON.stringify({snapshotId:snap2.id,paths:['README.md','src/intakeStart.ts'],focus:'Second run focus',history:''})})).json();
- await fetch(base+'/api/save',{method:'POST',headers:{Origin:base,'Content-Type':'application/json'},body:JSON.stringify({interviewId:current.interview.id,expectedVersion:current.interview.version,analysisToken:prep2.analysisToken,title:current.interview.title,focus:current.interview.focus,history:current.interview.history})});
+ await fetch(base+'/api/save',{method:'POST',headers:{Origin:base,'Content-Type':'application/json'},body:JSON.stringify({interviewId:current.interview.id,expectedVersion:current.interview.version,draftId:prep2.draftId,title:current.interview.title,focus:current.interview.focus,history:current.interview.history})});
 
  // Reopen in the browser and exercise run selection: 2 runs now, older run keeps
  // its edited answer, newer run starts with empty responses.

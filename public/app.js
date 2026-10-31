@@ -12,7 +12,18 @@ const node=(tag,text,cls)=>{const e=document.createElement(tag);if(text!==undefi
 function status(message,error=false){$('status').textContent=message;$('status').className=error?'error':'';}
 async function api(path,data){const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});const d=await r.json();if(!r.ok){const e=Error(d.error||'Request failed');e.status=r.status;throw e;}return d;}
 
-function controls(){for(const e of document.querySelectorAll('#repo, #filter, #focus, #history, #files input'))e.disabled=busy||e.dataset.available==='false';for(const id of ['load','demo','analyse','estimate'])$(id).disabled=busy||(['analyse','estimate'].includes(id)&&!snapshot);$('save').disabled=busy||!record;}
+function controls(){
+ for(const e of document.querySelectorAll('#repo, #filter, #focus, #history, #files input'))e.disabled=busy||e.dataset.available==='false';
+ for(const id of ['load','demo','analyse','estimate'])$(id).disabled=busy||(['analyse','estimate'].includes(id)&&!snapshot);
+ $('save').disabled=busy||!record;
+ // Finding 2: while a request is in flight (notably a save), lock editing and
+ // navigation so edits made mid-request cannot be silently overwritten by the
+ // response, and so the user cannot navigate away into a race. Interview fields,
+ // run selection, the saved list and New interview are all disabled while busy.
+ for(const e of document.querySelectorAll('#title, #review, #questions textarea'))e.disabled=busy;
+ for(const id of ['run-select','new-interview','refresh-list'])if($(id))$(id).disabled=busy;
+ for(const row of document.querySelectorAll('.ilist-item'))row.style.pointerEvents=busy?'none':'';
+}
 async function task(fn){if(busy)return;busy=true;controls();try{await fn();}catch(e){status(e.message,true);}finally{busy=false;controls();}}
 
 function setSaveState(s,msg){saveState=s;const el=$('save-state');el.className='savestate '+(s==='none'?'':s);el.textContent=msg||({none:'',unsaved:'Unsaved',saving:'Saving…',saved:'Saved',failed:'Save failed',conflict:'Conflict — reopen'}[s]||'');}
@@ -90,7 +101,7 @@ $('analyse').onclick=()=>task(async()=>{
  if(!invalidate())return;
  status('Reading selected text and preparing questions…');
  const d=await api('/api/analyse',p);
- record={...d,analysis:structuredClone(d.analysis),interviewStartedAt:new Date().toISOString(),interviewId:null,version:null,runId:null,runs:[],analysisToken:d.analysisToken,idempotencyKey:undefined};
+ record={...d,analysis:structuredClone(d.analysis),interviewStartedAt:new Date().toISOString(),interviewId:null,version:null,runId:null,runs:[],analysisToken:d.analysisToken,draftId:d.draftId||null,idempotencyKey:undefined};
  $('title').value='';
  renderInterview(null);renderRunBar();dirty=false;setSaveState('unsaved');
  $('review').value='';
@@ -111,7 +122,8 @@ $('save').onclick=()=>task(async()=>{
  setSaveState('saving');status('Saving to local database…');
  const body={title,focus:record.focus,history:record.history||'',teacherReview:$('review').value,responses:collectResponses()};
  if(record.interviewId){body.interviewId=record.interviewId;body.expectedVersion=record.version;body.runId=record.runId;}
- if(record.analysisToken){body.analysisToken=record.analysisToken;}
+ if(record.analysisToken)body.analysisToken=record.analysisToken;
+ if(record.draftId)body.draftId=record.draftId;
  if(!record.idempotencyKey)record.idempotencyKey=crypto.randomUUID();
  if(!record.interviewId)body.idempotencyKey=record.idempotencyKey;
  try{
@@ -125,17 +137,19 @@ $('save').onclick=()=>task(async()=>{
  }
 });
 
-// Adopt an authoritative saved/opened record into the working copy.
+// Adopt an authoritative saved/opened record into the working copy. Evidence is
+// the SELECTED run's own immutable evidence (per-run; Finding 1).
 function applySaved(saved){
- const ev=saved.evidence,run=saved.selectedRun;
+ const run=saved.selectedRun;const ev=(run&&run.evidence)||saved.evidence||{};
  record={
   schemaVersion:'l2ai-assess.v1',
   repository:ev.repository,commitSha:ev.commitSha,source:ev.source,retrievedAt:ev.retrievedAt,
   files:ev.files,unread:ev.unread,excludedEntries:ev.excludedEntries,
-  focus:saved.interview.focus,history:saved.interview.history,
+  focus:(run&&run.runInputs&&run.runInputs.focus)||saved.interview.focus,
+  history:(run&&run.runInputs&&run.runInputs.history!==undefined)?run.runInputs.history:saved.interview.history,
   analysis:structuredClone(run.analysis),model:run.model,
   interviewId:saved.interview.id,version:saved.interview.version,
-  runId:run.id,runs:saved.runs,analysisToken:null,
+  runId:run.id,runs:saved.runs,analysisToken:null,draftId:null,
   idempotencyKey:record?.idempotencyKey
  };
  $('title').value=saved.interview.title;

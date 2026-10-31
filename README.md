@@ -41,25 +41,26 @@ If you prefer to run without a database (original behaviour), leave `DATABASE_UR
 3. Click **Prepare interview**. Review the provisional understanding, typed observations and exact source quotes, questions, reasons, desired understanding and limitations.
 4. Edit questions, enter student answers, and add teacher verification or unresolved points. Question references identify the basis of a question; they do not corroborate its answer.
 5. Give the interview a **title** and click **Save interview** to store it in the local database. The save-state indicator shows *Unsaved → Saving… → Saved*, or *Conflict* / *Save failed*. Saving never reports success before persistence completes.
-6. Close the tab or restart the app, then reopen the interview from **Saved interviews (00)** and continue editing. Use the **Analysis run** selector to inspect earlier runs; each run keeps its own answers. **New interview** clears the workspace.
+6. **Save interview**, then either refresh the browser tab (a page reload) or stop and restart the Node server (an actual restart). Reopen the interview from **Saved interviews (00)** and continue editing. Use the **Analysis run** selector to inspect earlier runs; each run keeps its own evidence and answers. **New interview** clears the workspace.
 7. Export JSON and/or Markdown. JSON includes complete selected source text, Git blob SHA and SHA-256 digests, original and edited questions, answers, teacher notes, history, unread eligible files, provenance and model metadata, plus the interview and analysis-run identifiers. If the current edits are unsaved, the export is explicitly labelled as including unsaved edits. Export does not save to the database.
 
 Changing source selection, repository URL, focus or history invalidates the displayed analysis and (with unsaved edits) prompts before discarding. Snapshot handles expire after 30 minutes (20 snapshots maximum); reload to continue. A browser exit warning is shown only when there are unsaved edits.
 
 ## Local persistence
 
-Saving stores the interview in the isolated local database so it survives tab reloads and application restarts. The schema is four small tables (version-controlled migrations are the source of truth):
+Saving stores the interview in the isolated local database so it survives both a **browser page reload** (the tab is refreshed; the server keeps running) and an **actual application restart** (the Node server process is stopped and started again, losing all in-memory state). The schema is small (version-controlled migrations are the source of truth):
 
 - **interview** — title, assessment focus, pasted history, overall teacher review, timestamps, a `version` column for optimistic concurrency, and a unique `idempotency_key` that deduplicates a first save from double-clicks or retries.
-- **evidence_snapshot** (1:1) — repository, full pinned commit SHA, source/retrieval metadata, and the actual selected file contents with Git blob SHAs and SHA-256 digests (JSONB), plus unread/excluded metadata. Reopening and exporting use this snapshot; GitHub is not re-fetched.
-- **analysis_run** (many per interview) — the validated original analysis and questions with their source references (JSONB), the inputs used for that run, mock-vs-real provenance, model identifier, analysis time and any usage/cost. A new analysis inserts a new run; earlier runs and their answers are never overwritten.
-- **interview_response** — teacher-editable answers tied to a specific run and a stable question id (not array position): original question, edited question, student self-report and teacher verification.
+- **analysis_run** (many per interview) — the validated original analysis and questions with their source references (JSONB), the inputs used for that run (focus, history, selected paths), mock-vs-real provenance, model identifier, analysis time and any usage/cost. A new analysis inserts a new run; earlier runs and their answers are never overwritten.
+- **evidence_snapshot** (1:1 with a **run**) — repository, full pinned commit SHA, source/retrieval metadata, and the actual selected file contents with Git blob SHAs and SHA-256 digests (JSONB), plus unread/excluded metadata. Evidence is bound to its run and is never mutated afterwards, so opening or exporting any earlier run reflects exactly the repository, commit, files, focus and history that run was generated from — even after later runs change the material. Reopening and exporting use this snapshot; GitHub is not re-fetched.
+- **interview_response** — teacher-editable answers tied to a specific run and a stable question id (not array position): original question, edited question, student self-report and teacher verification. The original question text is derived from the run's authoritative analysis, and response question ids are validated against that analysis (unknown or duplicate ids are rejected).
+- **analysis_draft** — a short-lived server-authoritative copy of a freshly prepared analysis (evidence, validated questions, provenance, inputs). It lets the **first** save succeed even after the in-memory handle expires or the server restarts, without regenerating questions or losing teacher-entered answers. A draft is deleted once it is promoted to a saved run; stale drafts are pruned.
 
-Integrity: server-generated evidence and validated analysis are authoritative. `/api/save` reads them from a server-side handle minted by `/api/analyse`, never from browser-submitted source text or provenance; only teacher-editable fields and responses are accepted from the client. Related records are written in a single transaction (a failed save leaves no partial interview). A stale browser tab receives a `409` conflict instead of overwriting newer work. There is no silent fall-back to memory-only storage.
+Integrity: server-generated evidence and validated analysis are authoritative. `/api/save` reads them from a server-side handle minted by `/api/analyse` — the in-memory token, or the durable `analysis_draft` when the token is gone — never from browser-submitted source text or provenance; only teacher-editable fields and responses are accepted from the client. Related records are written in a single transaction (a failed save leaves no partial interview). While a save is in flight the UI locks editing and navigation so an edit made mid-request cannot be silently discarded by the response. A stale browser tab receives a `409` conflict instead of overwriting newer work. There is no silent fall-back to memory-only storage.
 
 Every application table has row-level security enabled with no policies, so the Supabase Data API (anon/service roles) exposes nothing; the server uses a direct Postgres connection. **Authentication and authorization are not implemented and are required before any external (non-loopback) deployment.** This remains single-teacher local scope: no accounts, multi-tenancy or production hardening.
 
-Adding a new analysis run to an **existing** saved interview is supported by the server and covered by tests, but is not a one-click UI action in this iteration: generating a run needs the source reloaded after a restart, and a one-click path risks mis-attaching answers. Preparing an interview always starts a new saved interview (run 1). Earlier runs of interviews that already have several are selectable in the UI.
+Adding a new analysis run to an **existing** saved interview is supported by the server and covered by tests, but is not a one-click UI action in this iteration: generating a run needs the source reloaded after a restart, and a one-click path risks mis-attaching answers. Preparing an interview always starts a new saved interview (run 1). Earlier runs of interviews that already have several are selectable in the UI, each showing its own evidence and answers.
 
 ## Offline mock rehearsal with real public material
 
@@ -125,13 +126,16 @@ npm run db:start                      # if not already running
 # one-time disposable test database on the same isolated container:
 docker exec supabase_db_l2ai_project_assess \
   psql -U postgres -d postgres -c "create database l2ai_assess_test;"
-docker exec -i supabase_db_l2ai_project_assess \
-  psql -U postgres -d l2ai_assess_test < supabase/migrations/20261031000001_init_persistence.sql
+# apply ALL migrations in order:
+for m in supabase/migrations/*.sql; do \
+  docker exec -i supabase_db_l2ai_project_assess \
+    psql -U postgres -d l2ai_assess_test -v ON_ERROR_STOP=1 < "$m"; \
+done
 cp .env.example .env.test             # then edit DATABASE_URL to .../l2ai_assess_test
-npm run test:db                       # truncates tables between tests
+npm run test:db                       # truncates tables between tests; refuses any non-test target
 ```
 
-`npm run test:db` covers save/reopen, source-and-hash round trip, edited-question/answer/note round trip, idempotent create, stale-update conflict, atomic-rollback of a failed multi-record save, re-analysis preserving prior runs and answers, server-authoritative save (forged browser source ignored, `409` on stale), and a database-unavailable error path.
+`npm run test:db` covers save/reopen, source-and-hash round trip, edited-question/answer/note round trip, idempotent create, stale-update conflict, atomic-rollback of a failed multi-record save, re-analysis preserving prior runs and answers, **per-run immutable evidence after changed-material re-analysis**, **durable drafts letting the first save proceed after token expiry/restart**, **rejection of unknown/duplicate response question ids**, server-authoritative save (forged browser source ignored, `409` on stale), the **disposable-database target guard** (dev/remote/wrong-port rejected before connecting), and a database-unavailable error path.
 
 For the browser tests, install Playwright and its Chromium (do not install anything from the assessed repository):
 
