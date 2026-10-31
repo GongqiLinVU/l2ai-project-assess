@@ -1,4 +1,7 @@
 .env
+.env.test
 node_modules/
 exports/
 *.log
+supabase/.temp/
+supabase/.branches/

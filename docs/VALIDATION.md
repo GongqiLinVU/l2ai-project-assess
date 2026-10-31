@@ -62,3 +62,58 @@ At the first local delivery, the remote was empty and all application files were
 3. All summaries are provisional; exact source quotations do not prove semantic support. Teacher review is required for model inferences, outdated documentation and test/runtime claims. Secret scanning and prompt-injection mitigation are best effort.
 4. There is no durable interview storage, resume import, formal session model or automatic historical comparison. Export before leaving the tab. Pasted previous-session text preserves the later-validation entry point.
 5. Private repos, student accounts, multi-tenancy, speech, scores, author/contribution checks and production integrations remain outside scope. Do not deploy this loopback prototype as a public service.
+
+---
+
+## Persistence iteration — local validation (31 October 2026, Melbourne)
+
+### Environment verified before changes
+
+| Check | Result |
+| --- | --- |
+| Starting point | Branch `main`, HEAD `8645654` ("Implement local evidence-based assessment interview prototype"). Working tree clean apart from an untracked `.claude/` tooling directory (left untouched). |
+| Prior persistence | Confirmed by reading the code: `server.mjs` kept repository snapshots in an in-memory `Map`; the interview record and answers lived only in the browser until exported. No database existed. |
+| Docker / isolation | Docker started. A full **Class Intake** Supabase stack (`supabase_*_milestoneproject`, DB on 54322, API 54321, Studio 54323, analytics 54327) and `l2ai-leads-db` (54328) were already running. This iteration created a **separate** project (`project_id = l2ai_project_assess`) on the free 54341–54343 block. Both stacks run simultaneously; the 11 milestoneproject containers were never stopped, reset, or modified. |
+
+### Persistence checks
+
+| # | Check | Result |
+| --- | --- | --- |
+| 1 | Migration applies to a clean, isolated database | **Passed.** `supabase start` applied `20261031000001_init_persistence.sql` cleanly; independently re-applied to two throwaway databases (`l2ai_assess_test`, `l2ai_migcheck`) with `ON_ERROR_STOP=1`. Result: 4 tables, all 4 with RLS enabled. |
+| 2 | Save and reopen a prepared mock interview | **Passed.** `npm run test:db` + the HTTP walkthrough save a demo-fixture mock interview and reopen it from a fresh read. |
+| 3 | Reload/restart preserves saved content | **Passed.** Browser walkthrough reloads the page (clearing in-memory state) and reopens from the saved list; title, answers and notes return. The HTTP walkthrough reopens via a fresh `/api/open` with no in-memory handle. |
+| 4 | Selected source contents and hashes survive the round trip | **Passed.** `test:db` asserts file `content` and `sha256` are byte-identical after save → reopen. |
+| 5 | Edited questions, answers and teacher notes survive | **Passed.** `test:db` round-trips edited question, student self-report and teacher verification by stable question id. |
+| 6 | Repeated/retried creation does not duplicate | **Passed.** `test:db` saves twice with one `idempotency_key`; one interview, one run. |
+| 7 | Stale updates rejected without overwriting | **Passed.** `test:db` and the HTTP walkthrough: an update on an old `version` throws `ConflictError` / returns HTTP `409`; newer work is intact. |
+| 8 | Failed multi-record save leaves no partial state | **Passed.** `test:db` forces the `evidence_snapshot` CHECK to fail after the interview insert; the transaction rolls back and no interview row remains (the idempotency key is reusable). |
+| 9 | Re-analysis preserves the previous run and its answers | **Passed.** `test:db` and the HTTP/browser walkthroughs: a new analysis inserts a new run; the earlier run and its recorded answer remain selectable. |
+| 10 | Reopened interviews export equivalent substantive content | **Passed.** The browser walkthrough exports JSON from a reopened record and asserts `interviewId`, `analysisRunId` and the `unsavedEdits` label; evidence (repository, full SHA, source files, hashes) comes from the stored snapshot. |
+| 11 | Database unavailability produces an accurate error | **Passed.** `/api/db/health` reports `{enabled, ok}`; the UI banner shows "Database unreachable" and disables/fails saving. `test:db` asserts a pool pointed at a closed port rejects. No silent memory fallback. |
+| 12 | Existing mock / evidence / paid-call gating tests still pass | **Passed.** `npm test` = 5/5 after the `server.mjs` rewrite. |
+
+### Commands used
+
+```bash
+npm test                      # 5/5 core tests pass (no DB)
+npm run test:db               # 8/8 persistence tests pass (disposable l2ai_assess_test)
+npm run test:ui               # core browser walkthrough: PASS
+node --env-file-if-exists=.env.test tests/browser-persistence.mjs   # persistence browser walkthrough: PASS
+```
+
+Browser runs used Playwright `1.64.1` (installed with `--no-save` outside the project and referenced via a temporary symlink that was removed afterwards) and the cached official **Chrome for Testing** build `chromium-1248`. No assessed-repository code or dependencies were installed or executed.
+
+### Integrity design (server-authoritative save)
+
+`/api/analyse` mints a short-lived `analysisToken` and caches the validated analysis, provenance and server-generated evidence in memory. `/api/save` reads evidence/analysis/provenance from that token, **not** from the browser; the HTTP test proves a forged `files:[{path:'evil.ts'...}]` in the save body is ignored. Only teacher-editable fields (title, focus, history, review, and per-question responses) and optimistic-concurrency/idempotency controls are accepted from the client. Every table enables RLS with no policies, so the Supabase Data API exposes nothing; the server connects directly via `pg`.
+
+### Design decisions needing review
+
+- **Re-analysis as a UI action.** Preparing an interview always creates a new saved interview (run 1). Adding another run to an *existing* interview is implemented and tested at the API/DB layer, but is deliberately **not** a one-click UI control this iteration: generating a run needs the source reloaded after a restart, and a one-click path risks mis-attaching answers to a different run. Run **selection** of multi-run interviews is in the UI.
+- **`npm install` now required.** One pinned dependency (`pg@8.23.1`) was added; the app is no longer zero-dependency. No assessed-repo dependency was added.
+- **Local credentials.** The local `DATABASE_URL` uses the Supabase CLI default `postgres:postgres` on loopback. Authentication/authorization are not implemented and are required before any non-loopback deployment.
+
+### Not run / out of scope this iteration
+
+- No hosted Supabase link, deployment, remote database, or paid model call was performed.
+- `LIVE_GITHUB=1` browser path was not re-run in this iteration (unchanged from the prior validation); the offline pinned fixture was used throughout.

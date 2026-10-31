@@ -1,0 +1,62 @@
+# L2AI Project Assess — isolated local Supabase configuration.
+#
+# This project is DELIBERATELY ISOLATED from the Engineering Studio / Class Intake
+# stack (project_id "milestoneproject", ports 54321-54327) and from "l2ai-leads-db"
+# (port 54328). It uses a distinct project_id and the 54340-54349 port block so the
+# two stacks can run at the same time without collision.
+#
+# The Node application connects to the database DIRECTLY via `pg` (see lib/db.mjs);
+# it does NOT use the PostgREST Data API. All application tables enable RLS with no
+# policies, so the anon/service Data API exposes nothing. Authentication and
+# authorization MUST be added before any external deployment.
+#
+# Reference: https://supabase.com/docs/guides/local-development/cli/config
+
+project_id = "l2ai_project_assess"
+
+[api]
+enabled = true
+port = 54341
+schemas = ["public"]
+extra_search_path = ["public", "extensions"]
+max_rows = 1000
+
+[db]
+# Direct Postgres port used by the Node app (DATABASE_URL) and migrations.
+port = 54342
+# Shadow database port for `supabase db diff`.
+shadow_port = 54340
+major_version = 17
+
+[db.pooler]
+enabled = false
+
+[db.migrations]
+enabled = true
+
+[db.seed]
+enabled = false
+
+[studio]
+enabled = true
+port = 54343
+
+[inbucket]
+enabled = false
+
+[storage]
+enabled = false
+
+[auth]
+# Not used by this iteration (single-teacher local scope, no accounts). Kept
+# disabled to minimise footprint. Enable and configure before external deployment.
+enabled = false
+
+[realtime]
+enabled = false
+
+[analytics]
+enabled = false
+
+[edge_runtime]
+enabled = false

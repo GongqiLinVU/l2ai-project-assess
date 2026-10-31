@@ -8,6 +8,10 @@ let browser;
 try{
  browser=await chromium.launch({headless:true,executablePath:process.env.CHROMIUM_EXECUTABLE,args:['--no-sandbox']});
  const page=await browser.newPage({viewport:{width:1440,height:1000}});const errors=[];page.on('pageerror',e=>errors.push(e.message));
+ // Persistence iteration adds unsaved-change protection: changing evidence inputs
+ // with unsaved teacher edits prompts a confirm dialog. Accept it so this
+ // rehearsal's stale-analysis-invalidation assertions proceed as before.
+ page.on('dialog',d=>d.accept());
  await page.goto(base);await page.getByRole('button',{name:'Use offline demo',exact:true}).click();await page.getByText(/3\/5 selected/).waitFor();
  await page.locator('#history').fill('S1 rehearsal: student planned to separate prior context from current progress. Synthetic history, not a real student record.');
  await page.getByRole('button',{name:'Estimate model usage'}).click();await page.locator('#budget').waitFor();assert.match(await page.locator('#budget').innerText(),/estimatedMaxUsd/);
