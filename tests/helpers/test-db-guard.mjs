@@ -45,3 +45,34 @@ export function assertDisposableTestDb(connectionString = process.env.DATABASE_U
   }
   return { host, port, database };
 }
+
+// For the migration-upgrade test we must CREATE/DROP throwaway databases. That
+// needs a connection to the maintenance `postgres` database, and throwaway names
+// that cannot possibly be the dev database, the Class Intake stack, or anything
+// shared. This guard enforces: the maintenance connection is on the isolated
+// loopback host+port (derived from DATABASE_URL), and every throwaway DB name
+// carries the dedicated `l2ai_migtest_` prefix. Anything else is rejected before
+// a CREATE/DROP runs.
+const THROWAWAY_PREFIX = 'l2ai_migtest_';
+
+export function maintenanceUrlForTests(connectionString = process.env.DATABASE_URL) {
+  // Validates host/port/db against the disposable target, then swaps the database
+  // to `postgres` so CREATE/DROP DATABASE can run.
+  const { host, port } = assertDisposableTestDb(connectionString);
+  const url = new URL(connectionString);
+  url.pathname = '/postgres';
+  return { url: url.href, host, port };
+}
+
+export function assertThrowawayDbName(name) {
+  if (typeof name !== 'string' || !name.startsWith(THROWAWAY_PREFIX) || !/^[a-z0-9_]+$/.test(name) || name.length > 48) {
+    throw new Error(`Refusing CREATE/DROP DATABASE: "${name}" is not a valid disposable throwaway name (must start with "${THROWAWAY_PREFIX}" and contain only [a-z0-9_]).`);
+  }
+  // Belt and braces: never allow the known real databases.
+  for (const forbidden of ['postgres', 'l2ai_assess_test', 'milestoneproject']) {
+    if (name === forbidden) throw new Error(`Refusing CREATE/DROP DATABASE on protected database "${name}".`);
+  }
+  return name;
+}
+
+export { THROWAWAY_PREFIX };

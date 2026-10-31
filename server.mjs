@@ -4,7 +4,7 @@ import {randomUUID} from 'node:crypto';
 import {resolveRepository,readSelected} from './lib/github.mjs';
 import {analyse,estimate} from './lib/model.mjs';
 import {LIMITS} from './lib/evidence.mjs';
-import {saveInterview,listInterviews,openInterview,ping,createDraft,getDraft,pruneDrafts,ConflictError,NotFoundError,ValidationError} from './lib/db.mjs';
+import {saveInterview,listInterviews,openInterview,ping,createDraft,getDraft,pruneDrafts,findInterviewByIdempotencyKey,ConflictError,NotFoundError,ValidationError} from './lib/db.mjs';
 
 const snapshots=new Map();
 // Server-authoritative analysis results. /api/analyse mints a token here; /api/save
@@ -66,9 +66,20 @@ export function createApp(){return http.createServer(async(req,res)=>{
  // Durable draft so the FIRST save works after token expiry / restart (Finding 4).
  // Evidence and analysis stay server-authoritative; the draft is the server's own
  // copy, not browser-submitted. Pruned opportunistically.
- let draftId=null;
- if(DB_ENABLED){try{pruneDrafts().catch(()=>{});draftId=await createDraft({evidence,analysis,runInputs,model:result.model});}catch(e){draftId=null;}}
- reply(200,{schemaVersion:'l2ai-assess.v1',analysisToken,draftId,...evidence,focus:body.focus,history:body.history,analysis,model:result.model});
+ //
+ // If persistence is configured, a draft-write failure MUST be surfaced, not
+ // swallowed: the preparation would then be memory-only and NOT restart-safe, and
+ // silently presenting it as durable risks losing the prepared analysis on
+ // restart. We keep the in-memory token (so the prepared analysis survives for an
+ // immediate save/retry while the process lives) and report draftPersisted:false
+ // with a clear warning so the client can show the real durability state.
+ let draftId=null,draftPersisted=!DB_ENABLED?null:false,draftError=null;
+ if(DB_ENABLED){
+  pruneDrafts().catch(()=>{});
+  try{draftId=await createDraft({evidence,analysis,runInputs,model:result.model});draftPersisted=true;}
+  catch(e){draftId=null;draftPersisted=false;draftError='Prepared analysis could not be saved for restart-safe recovery ('+(e.message||'database error')+'). It is held in memory only; save now, and do not rely on reopening after an application restart until a save succeeds.';}
+ }
+ reply(200,{schemaVersion:'l2ai-assess.v1',analysisToken,draftId,draftPersisted,draftError,...evidence,focus:body.focus,history:body.history,analysis,model:result.model});
  }catch(e){fail(e);}
  });}
 
@@ -92,6 +103,19 @@ async function handleSave(body,reply){
   title,focus:body.focus,history:body.history??'',teacherReview:body.teacherReview??'',
   responses:shapeResponses(body.responses)
  };
+
+ // FIRST-SAVE RETRY (Finding, this round): a first save creates the interview AND
+ // consumes its durable draft in one transaction. If the response was lost and the
+ // client retries — possibly after the in-memory token expired AND an actual
+ // server restart (so the draft is already gone) — an already-committed
+ // idempotency key must resolve to the existing interview/run BEFORE we require a
+ // live token or an unconsumed draft. This returns the original record without
+ // creating a duplicate interview or run. Only applies to the create path
+ // (no interviewId): updates carry their own interviewId and optimistic version.
+ if(!payload.interviewId&&payload.idempotencyKey){
+  const existing=await findInterviewByIdempotencyKey(payload.idempotencyKey);
+  if(existing)return reply(200,existing);
+ }
 
  // Resolve the authoritative prepared analysis for a NEW run from either the
  // in-memory token or the durable draft (so first save survives restart).

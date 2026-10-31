@@ -1,6 +1,6 @@
 {
   "name": "l2ai-project-assess",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "engines": {
@@ -10,6 +10,7 @@
     "start": "node --env-file-if-exists=.env server.mjs",
     "test": "node --test tests/core.test.mjs",
     "test:db": "node --env-file-if-exists=.env.test --test tests/db.test.mjs",
+    "test:migrate": "node --env-file-if-exists=.env.test --test tests/migration.test.mjs",
     "test:ui": "node tests/browser.mjs",
     "db:start": "supabase start",
     "db:stop": "supabase stop",

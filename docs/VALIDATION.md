@@ -172,3 +172,79 @@ or executed. All changes are local and uncommitted.
 - `LIVE_GITHUB=1` was not re-run this round; the offline pinned fixture was used.
 - The two-process restart proof used a scratch script that was deleted after the run;
   the restart-safe path is also covered in-process by the `test:db` draft test.
+
+---
+
+## Follow-up review fixes — local validation (31 October 2026, Melbourne)
+
+Three follow-up findings on commit `e748250` were addressed on `feat/local-persistence`.
+Migration `20261031000002_per_run_evidence_and_drafts.sql` was **rewritten** from a
+destructive drop-and-recreate into a data-preserving, transactional upgrade.
+
+### Findings and checks
+
+| # | Finding | Fix | Check | Result |
+| --- | --- | --- | --- | --- |
+| 1 | The evidence migration was destructive and only tested on a clean database. | Migration 2 now upgrades in place inside a transaction: it archives all legacy evidence verbatim into `evidence_snapshot_legacy`, re-keys `evidence_snapshot` to `analysis_run_id`, and backfills legacy evidence onto a run **only when the interview has exactly one run** (unambiguous). If any interview with legacy evidence has more than one run it **RAISES and rolls back**, naming the interviews; evidence with no run is left only in the archive with a `notice`. | `npm run test:migrate`: (a) populated v0.2 unambiguous DB keeps interview/run/answers and re-binds evidence to the run, archive retained; (b) populated v0.2 ambiguous DB (legacy evidence + 2 runs) raises `Ambiguous legacy evidence mapping`, rolls back, old schema + all data intact, no new tables. Also exercised manually against two throwaway DBs. | **Passed** |
+| 2 | `createDraft` failures were swallowed; a memory-only prep was presented as restart-safe. | `/api/analyse` now reports `draftPersisted` and, on failure, `draftError`; it keeps the in-memory token (so the prepared analysis is not lost) but clearly marks the prep as NOT restart-safe. The UI shows the warning as an error status. | `npm run test:db` "a draft-write failure is surfaced, not swallowed": with `analysis_draft` temporarily removed, `/api/analyse` returns `draftPersisted:false`, a clear `draftError`, `draftId:null`, and still returns the analysis + a usable token; an immediate token save then succeeds. | **Passed** |
+| 3 | First-save retries failed after draft promotion + restart (duplicate risk / draft-expired error). | `handleSave` resolves an already-committed `idempotencyKey` to the existing interview/run **before** requiring a live token or unconsumed draft (`findInterviewByIdempotencyKey`). The create path still dedupes inside the transaction, so no duplicate interview or run is created. | `npm run test:db`: (a) db-layer resolves a committed key to the same interview/run with the answer preserved; (b) HTTP lost-response across **two separate server processes** (actual restart) — retry with the same key + stale `draftId` returns the ORIGINAL interview/run, answer preserved, exactly one interview and one run. | **Passed** |
+
+### Page reload vs actual server restart (unchanged distinction, re-verified)
+
+- **Page reload** — the tab refreshes; the server keeps running and its in-memory
+  token still exists (persistence browser walkthrough).
+- **Actual server restart** — a new Node process with empty in-memory state. The
+  first-save retry test (Finding 3b) now exercises this directly with two separate
+  `createApp()` server instances: process A commits the first save and is closed;
+  process B serves the retry purely from the committed idempotency key.
+
+### Recovery notes — if the earlier DESTRUCTIVE migration was already applied
+
+The previous `20261031000002` ran `drop table if exists evidence_snapshot`, discarding
+interview-keyed evidence. Recovery depends on when it ran:
+
+- **This local dev database (`postgres` on 54342):** when the destructive migration
+  was applied it held **zero** interviews, runs, responses and evidence (verified:
+  `select count(*)` = 0 on every table), so **no data was lost**. The dev database
+  has been recreated cleanly from both migrations and now matches a properly-upgraded
+  database (includes `evidence_snapshot_legacy`). This was the only environment the
+  destructive migration ever touched.
+- **A populated database that already ran the destructive version:** the dropped
+  legacy evidence is **unrecoverable from the database** unless an external backup
+  (e.g. `pg_dump`, a filesystem/volume snapshot, or a prior export) exists. Runs,
+  responses and interviews were not dropped and remain intact; only the legacy
+  `evidence_snapshot` rows were lost. Recovery options, best first:
+  1. Restore `evidence_snapshot` from a `pg_dump`/volume snapshot taken before the
+     destructive run, then apply the data-preserving migration to a copy.
+  2. Re-derive evidence for affected runs by re-fetching the pinned commit from
+     GitHub (the full commit SHA and selected paths survive in `analysis_run.run_inputs`),
+     and re-insert into the per-run `evidence_snapshot`. This reproduces source text
+     and hashes but not the original `retrieved_at`.
+  3. If neither is possible, the evidence snapshot for those runs is permanently
+     lost; the runs, questions and answers still open and export, but without their
+     pinned source text. This limitation must be stated in any affected export.
+  No remote database was operated to perform or verify this; the guidance is based on
+  the local schema and the verified-empty state of the only affected database.
+
+### Commands run (this round)
+
+```bash
+npm test            # 5/5 core tests pass (no DB)
+npm run test:db     # 15/15 persistence tests pass (adds draft-failure + two first-save-retry regressions)
+npm run test:migrate# 2/2 populated-database upgrade tests pass (unambiguous preserve; ambiguous reject+rollback)
+npm run test:ui     # core browser walkthrough: PASS
+node --env-file-if-exists=.env.test tests/browser-persistence.mjs   # persistence walkthrough: PASS
+```
+
+Migration behaviour was additionally verified by hand against throwaway databases
+(`l2ai_upgrade_a` unambiguous, `l2ai_upgrade_b` ambiguous), both dropped afterwards.
+Browser runs used Playwright `1.64.1` installed outside the project (`--no-save`,
+temporary symlink removed afterwards) and the cached official Chrome for Testing build.
+
+### Not run / unverified (this round)
+
+- No hosted Supabase, deployment, remote database operation, or paid model call.
+- `LIVE_GITHUB=1` was not re-run; the offline pinned fixture was used throughout.
+- Recovery option 1/2 for a populated destructively-migrated database is documented,
+  not executed, because no such populated database exists locally (the only affected
+  database was verified empty).

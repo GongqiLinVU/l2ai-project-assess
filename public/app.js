@@ -101,11 +101,16 @@ $('analyse').onclick=()=>task(async()=>{
  if(!invalidate())return;
  status('Reading selected text and preparing questions…');
  const d=await api('/api/analyse',p);
- record={...d,analysis:structuredClone(d.analysis),interviewStartedAt:new Date().toISOString(),interviewId:null,version:null,runId:null,runs:[],analysisToken:d.analysisToken,draftId:d.draftId||null,idempotencyKey:undefined};
+ record={...d,analysis:structuredClone(d.analysis),interviewStartedAt:new Date().toISOString(),interviewId:null,version:null,runId:null,runs:[],analysisToken:d.analysisToken,draftId:d.draftId||null,draftPersisted:d.draftPersisted,idempotencyKey:undefined};
  $('title').value='';
  renderInterview(null);renderRunBar();dirty=false;setSaveState('unsaved');
  $('review').value='';
- controls();status('Interview ready. Add a title, edit questions, record answers, then Save.');$('interview').scrollIntoView({behavior:'smooth'});
+ controls();
+ // Surface a draft-persistence failure honestly: the prep is memory-only and NOT
+ // restart-safe until a save succeeds (Finding 2, this round).
+ if(d.draftPersisted===false){status((d.draftError||'Prepared analysis could not be saved for restart-safe recovery; it is held in memory only. Save now.'),true);}
+ else{status('Interview ready. Add a title, edit questions, record answers, then Save.');}
+ $('interview').scrollIntoView({behavior:'smooth'});
 });
 
 $('title').addEventListener('input',markDirty);

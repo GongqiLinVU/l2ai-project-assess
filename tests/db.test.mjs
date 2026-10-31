@@ -11,7 +11,7 @@ import {test,before,beforeEach,after} from 'node:test';
 import assert from 'node:assert/strict';
 import pg from 'pg';
 import {saveInterview,openInterview,listInterviews,ping,closePool,getPool,
-        createDraft,getDraft,ConflictError,ValidationError} from '../lib/db.mjs';
+        createDraft,getDraft,findInterviewByIdempotencyKey,ConflictError,ValidationError} from '../lib/db.mjs';
 import {createApp} from '../server.mjs';
 import {analyse} from '../lib/model.mjs';
 import {resolveRepository,readSelected} from '../lib/github.mjs';
@@ -205,8 +205,99 @@ test('HTTP: save via durable draftId (token gone) is server-authoritative; forge
   } finally { await new Promise(r => app.close(r)); }
 });
 
+test('Round 3 Finding 2: a draft-write failure is surfaced, not swallowed (analysis kept in memory, flagged not restart-safe)', async () => {
+  // Force createDraft to fail by temporarily removing analysis_draft, then confirm
+  // /api/analyse reports draftPersisted:false with a clear warning while STILL
+  // returning the prepared analysis + a usable in-memory token.
+  const app = createApp(); await new Promise(r => app.listen(0, '127.0.0.1', r));
+  const base = 'http://127.0.0.1:' + app.address().port;
+  const post = (route, data) => fetch(base + route, { method: 'POST', headers: { Origin: base, 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
+  await getPool().query('alter table analysis_draft rename to analysis_draft_tmp_hidden');
+  try {
+    const snap = await (await post('/api/resolve', { url: 'https://github.com/GongqiLinVU/milestoneproject', demo: true })).json();
+    const prepared = await (await post('/api/analyse', { snapshotId: snap.id, paths: ['README.md'], focus: 'draft fail', history: '' })).json();
+    assert.equal(prepared.draftPersisted, false, 'draft persistence failure is reported');
+    assert.match(prepared.draftError || '', /restart-safe|memory only|could not be saved/i, 'clear warning present');
+    assert.equal(prepared.draftId, null, 'no draftId when the write failed');
+    assert.ok(prepared.analysisToken, 'in-memory token still returned so the prep is not lost');
+    assert.ok(Array.isArray(prepared.analysis.questions) && prepared.analysis.questions.length >= 1, 'analysis preserved for immediate save/retry');
+    // The in-memory token still allows an immediate save while the process lives.
+    await getPool().query('alter table analysis_draft_tmp_hidden rename to analysis_draft');  // restore before saving
+    const saved = await (await post('/api/save', { analysisToken: prepared.analysisToken, idempotencyKey: 'draftfail-' + Date.now(), title: 'Draft fail save', focus: 'draft fail', history: '', responses: [{ questionId: prepared.analysis.questions[0].qid, studentSelfReport: 'still saved' }] })).json();
+    assert.ok(saved.interview.id, 'immediate save via token still works');
+  } finally {
+    // Ensure the table is restored even if an assertion failed before the rename-back.
+    await getPool().query('alter table if exists analysis_draft_tmp_hidden rename to analysis_draft').catch(() => {});
+    await new Promise(r => app.close(r));
+  }
+});
+
 test('database unavailability produces a visible error (no silent memory fallback)', async () => {
   const bad = new pg.Pool({ connectionString: 'postgresql://postgres:postgres@127.0.0.1:1/postgres', connectionTimeoutMillis: 1500 });
   await assert.rejects(() => bad.query('select 1'));
   await bad.end();
+});
+
+test('Round 3 Finding 3: first-save retry resolves an already-committed idempotency key (db layer)', async () => {
+  const auth = await prepareAuthoritative();
+  const key = 'retry-db-' + Date.now();
+  const first = await saveInterview({
+    idempotencyKey: key, title: 'Retry', focus: 'f', history: '', evidence: auth.evidence,
+    run: { analysis: auth.analysis, runInputs: auth.runInputs, model: auth.model },
+    responses: [{ questionId: 'q1', studentSelfReport: 'kept answer' }]
+  });
+  // The draft is consumed and the token would be gone after a restart; the retry
+  // path resolves purely by the committed idempotency key.
+  const resolved = await findInterviewByIdempotencyKey(key);
+  assert.ok(resolved, 'key resolves to the committed record');
+  assert.equal(resolved.interview.id, first.interview.id, 'same interview, no duplicate');
+  assert.equal(resolved.selectedRun.id, first.selectedRun.id, 'same run');
+  assert.equal(resolved.selectedRun.responses[0].studentSelfReport, 'kept answer', 'answer preserved');
+  assert.equal(await findInterviewByIdempotencyKey('never-used'), null, 'unknown key resolves to null');
+});
+
+test('Round 3 Finding 3: HTTP lost first-save response -> actual server restart -> retry returns original, no duplicate', async () => {
+  // Process A: prepare + first save (consumes the draft), then "lose" the response.
+  const appA = createApp(); await new Promise(r => appA.listen(0, '127.0.0.1', r));
+  const baseA = 'http://127.0.0.1:' + appA.address().port;
+  const postA = (route, data) => fetch(baseA + route, { method: 'POST', headers: { Origin: baseA, 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
+  const key = 'http-retry-' + Date.now();
+  let draftId, qids, firstInterviewId, firstRunId;
+  try {
+    const snap = await (await postA('/api/resolve', { url: 'https://github.com/GongqiLinVU/milestoneproject', demo: true })).json();
+    const prepared = await (await postA('/api/analyse', { snapshotId: snap.id, paths: ['README.md'], focus: 'restart retry', history: '' })).json();
+    draftId = prepared.draftId; qids = prepared.analysis.questions.map(q => q.qid);
+    const saved = await (await postA('/api/save', {
+      draftId, idempotencyKey: key, title: 'Restart retry', focus: 'restart retry', history: '',
+      responses: [{ questionId: qids[0], studentSelfReport: 'answer before lost response' }]
+    })).json();
+    firstInterviewId = saved.interview.id; firstRunId = saved.selectedRun.id;
+    assert.ok(firstInterviewId, 'first save committed');
+    // Confirm the draft was consumed (promoted).
+    assert.equal(await getDraft(draftId), null, 'draft consumed on first save');
+  } finally {
+    // "Lost response": the client never learned the interview id. Shut down A —
+    // an ACTUAL restart: all in-memory tokens are gone.
+    await new Promise(r => appA.close(r));
+  }
+
+  // Process B: brand-new server (empty in-memory cache). Client retries the SAME
+  // first save (same idempotencyKey) with the now-stale draftId and no token.
+  const appB = createApp(); await new Promise(r => appB.listen(0, '127.0.0.1', r));
+  const baseB = 'http://127.0.0.1:' + appB.address().port;
+  const postB = (route, data) => fetch(baseB + route, { method: 'POST', headers: { Origin: baseB, 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
+  try {
+    const res = await postB('/api/save', {
+      draftId, idempotencyKey: key, title: 'Restart retry', focus: 'restart retry', history: '',
+      responses: [{ questionId: qids[0], studentSelfReport: 'answer before lost response' }]
+    });
+    assert.equal(res.status, 200, 'retry succeeds (not a draft-expired error)');
+    const body = await res.json();
+    assert.equal(body.interview.id, firstInterviewId, 'retry returns the ORIGINAL interview');
+    assert.equal(body.selectedRun.id, firstRunId, 'retry returns the ORIGINAL run (no duplicate)');
+    assert.equal(body.selectedRun.responses[0].studentSelfReport, 'answer before lost response', 'answer preserved');
+    // No duplicate interviews or runs.
+    assert.equal((await listInterviews()).filter(i => i.id === firstInterviewId).length, 1, 'exactly one interview');
+    assert.equal((await openInterview(firstInterviewId)).runs.length, 1, 'exactly one run');
+  } finally { await new Promise(r => appB.close(r)); }
 });
