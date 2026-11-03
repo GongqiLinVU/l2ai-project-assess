@@ -123,12 +123,52 @@ try{
  await page.getByRole('button',{name:'New interview',exact:true}).click();
  assert.equal(await page.locator('#interview').isVisible(),false,'interview reset on New interview');
 
+ // ---- Payload-consistent idempotency after a LOST first-save response ----
+ // Prepare a fresh interview, then make the FIRST save's response never reach the
+ // client (the server still commits). The UI keeps interviewId=null and the same
+ // idempotency key. The teacher then edits the answer and retries: the server
+ // sees a CHANGED payload under the committed key and returns a conflict, so the
+ // UI must show "Conflict" (not "Saved") and KEEP the edited answer visible.
+ await page.getByRole('button',{name:'Use offline demo',exact:true}).click();
+ await page.getByText(/3\/5 selected/).waitFor();
+ await page.getByRole('button',{name:'Prepare interview',exact:true}).click();
+ await page.locator('#interview').waitFor();
+ await page.locator('#title').fill('Lost response test');
+ await page.locator('#a0').fill('FIRST answer that commits server-side.');
+
+ // Drop ONLY the first /api/save response (the request still reaches the server).
+ let dropped=false;
+ await page.route('**/api/save',async route=>{
+  if(!dropped){dropped=true;
+   // Let the server process + commit, then abort so the client never sees 200.
+   try{await route.fetch();}catch{}
+   await route.abort('failed');
+  } else { await route.continue(); }
+ });
+ await page.getByRole('button',{name:'Save interview',exact:true}).click();
+ // The dropped response surfaces as a (non-409) save failure; edits are retained.
+ await page.waitForFunction(()=>document.getElementById('save-state').textContent==='Save failed',{},{timeout:10000});
+ await page.unroute('**/api/save');
+
+ // Teacher edits the answer and retries with the SAME idempotency key.
+ await page.locator('#a0').fill('SECOND answer — the teacher changed it after the lost response.');
+ await page.getByRole('button',{name:'Save interview',exact:true}).click();
+ // Must be a CONFLICT, not a false "Saved".
+ await page.waitForFunction(()=>document.getElementById('save-state').textContent.startsWith('Conflict'),{},{timeout:10000});
+ assert.notEqual(await page.locator('#save-state').textContent(),'Saved','retry with changed content must NOT report Saved');
+ // The teacher's edited answer is still visible (not discarded/overwritten).
+ assert.equal(await page.locator('#a0').inputValue(),'SECOND answer — the teacher changed it after the lost response.','edited answer preserved after conflict');
+ // Exactly one interview was committed (no duplicate from the retry).
+ const listed=await (await fetch(base+'/api/interviews',{method:'POST',headers:{Origin:base,'Content-Type':'application/json'},body:'{}'})).json();
+ assert.equal(listed.interviews.filter(i=>i.title==='Lost response test').length,1,'no duplicate interview from the retry');
+ await page.getByRole('button',{name:'New interview',exact:true}).click();
+
  // Narrow-screen usability: no horizontal overflow.
  await page.setViewportSize({width:390,height:844});
  assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),'no mobile horizontal overflow');
 
  assert.deepEqual(errors,[],'no page errors');
- console.log('PASS persistence UI: save, saved-list, restart+reopen, continue editing, re-save, two runs + run selection, unsaved export label, New interview reset, no mobile overflow, no page errors.');
+ console.log('PASS persistence UI: save, saved-list, restart+reopen, continue editing, re-save, two runs + run selection, unsaved export label, New interview reset, lost-response payload-consistent retry (conflict, edits preserved, no duplicate), no mobile overflow, no page errors.');
 }finally{
  await browser?.close();
  await new Promise(r=>app.close(r));

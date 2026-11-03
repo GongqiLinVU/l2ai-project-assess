@@ -4,7 +4,7 @@ import {randomUUID} from 'node:crypto';
 import {resolveRepository,readSelected} from './lib/github.mjs';
 import {analyse,estimate} from './lib/model.mjs';
 import {LIMITS} from './lib/evidence.mjs';
-import {saveInterview,listInterviews,openInterview,ping,createDraft,getDraft,pruneDrafts,findInterviewByIdempotencyKey,ConflictError,NotFoundError,ValidationError} from './lib/db.mjs';
+import {saveInterview,listInterviews,openInterview,ping,createDraft,getDraft,pruneDrafts,findInterviewByIdempotencyKey,requestFingerprint,ConflictError,NotFoundError,ValidationError} from './lib/db.mjs';
 
 const snapshots=new Map();
 // Server-authoritative analysis results. /api/analyse mints a token here; /api/save
@@ -103,18 +103,30 @@ async function handleSave(body,reply){
   title,focus:body.focus,history:body.history??'',teacherReview:body.teacherReview??'',
   responses:shapeResponses(body.responses)
  };
+ // Fingerprint the teacher-editable content so first-save retries are
+ // payload-consistent (identical retry replays; changed retry conflicts).
+ payload.requestFingerprint=requestFingerprint({title:payload.title,focus:payload.focus,history:payload.history,teacherReview:payload.teacherReview,responses:payload.responses});
 
- // FIRST-SAVE RETRY (Finding, this round): a first save creates the interview AND
+ // FIRST-SAVE RETRY (payload-consistent): a first save creates the interview AND
  // consumes its durable draft in one transaction. If the response was lost and the
- // client retries — possibly after the in-memory token expired AND an actual
- // server restart (so the draft is already gone) — an already-committed
- // idempotency key must resolve to the existing interview/run BEFORE we require a
- // live token or an unconsumed draft. This returns the original record without
- // creating a duplicate interview or run. Only applies to the create path
- // (no interviewId): updates carry their own interviewId and optimistic version.
+ // client retries — possibly after the in-memory token expired AND a server
+ // restart (so the draft is already gone) — an already-committed idempotency key
+ // must resolve BEFORE we require a live token or an unconsumed draft. But it must
+ // only REPLAY when the content is unchanged:
+ //   * identical retry (fingerprint matches, or legacy row has no fingerprint)
+ //     -> return the committed interview/run, no duplicate;
+ //   * changed retry (fingerprint differs) -> 409 conflict, so the UI preserves
+ //     the teacher's current edits instead of showing a false "Saved".
+ // Only applies to the create path (no interviewId); updates carry their own
+ // interviewId + optimistic version.
  if(!payload.interviewId&&payload.idempotencyKey){
   const existing=await findInterviewByIdempotencyKey(payload.idempotencyKey);
-  if(existing)return reply(200,existing);
+  if(existing){
+   if(existing.fingerprint!==null&&existing.fingerprint!==payload.requestFingerprint){
+    throw new ConflictError('This interview was already saved with different content under the same request. Your current edits were NOT saved and remain in the form. Reopen the saved interview to continue, or save again to update it.');
+   }
+   return reply(200,existing.record);
+  }
  }
 
  // Resolve the authoritative prepared analysis for a NEW run from either the

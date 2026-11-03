@@ -11,7 +11,7 @@ import {test,before,beforeEach,after} from 'node:test';
 import assert from 'node:assert/strict';
 import pg from 'pg';
 import {saveInterview,openInterview,listInterviews,ping,closePool,getPool,
-        createDraft,getDraft,findInterviewByIdempotencyKey,ConflictError,ValidationError} from '../lib/db.mjs';
+        createDraft,getDraft,findInterviewByIdempotencyKey,requestFingerprint,ConflictError,ValidationError} from '../lib/db.mjs';
 import {createApp} from '../server.mjs';
 import {analyse} from '../lib/model.mjs';
 import {resolveRepository,readSelected} from '../lib/github.mjs';
@@ -241,23 +241,30 @@ test('database unavailability produces a visible error (no silent memory fallbac
 test('Round 3 Finding 3: first-save retry resolves an already-committed idempotency key (db layer)', async () => {
   const auth = await prepareAuthoritative();
   const key = 'retry-db-' + Date.now();
+  const fp = requestFingerprint({ title: 'Retry', focus: 'f', history: '', teacherReview: '', responses: [{ questionId: 'q1', studentSelfReport: 'kept answer' }] });
   const first = await saveInterview({
-    idempotencyKey: key, title: 'Retry', focus: 'f', history: '', evidence: auth.evidence,
+    idempotencyKey: key, requestFingerprint: fp, title: 'Retry', focus: 'f', history: '', evidence: auth.evidence,
     run: { analysis: auth.analysis, runInputs: auth.runInputs, model: auth.model },
     responses: [{ questionId: 'q1', studentSelfReport: 'kept answer' }]
   });
   // The draft is consumed and the token would be gone after a restart; the retry
-  // path resolves purely by the committed idempotency key.
+  // path resolves purely by the committed idempotency key. The lookup now returns
+  // { record, fingerprint } so the handler can compare payloads.
   const resolved = await findInterviewByIdempotencyKey(key);
-  assert.ok(resolved, 'key resolves to the committed record');
-  assert.equal(resolved.interview.id, first.interview.id, 'same interview, no duplicate');
-  assert.equal(resolved.selectedRun.id, first.selectedRun.id, 'same run');
-  assert.equal(resolved.selectedRun.responses[0].studentSelfReport, 'kept answer', 'answer preserved');
+  assert.ok(resolved && resolved.record, 'key resolves to the committed record');
+  assert.equal(resolved.fingerprint, fp, 'stored fingerprint round-trips for payload comparison');
+  assert.equal(resolved.record.interview.id, first.interview.id, 'same interview, no duplicate');
+  assert.equal(resolved.record.selectedRun.id, first.selectedRun.id, 'same run');
+  assert.equal(resolved.record.selectedRun.responses[0].studentSelfReport, 'kept answer', 'answer preserved');
   assert.equal(await findInterviewByIdempotencyKey('never-used'), null, 'unknown key resolves to null');
 });
 
-test('Round 3 Finding 3: HTTP lost first-save response -> actual server restart -> retry returns original, no duplicate', async () => {
-  // Process A: prepare + first save (consumes the draft), then "lose" the response.
+test('Round 3 Finding 3: lost first-save response -> retry (same in-process server) returns original, no duplicate', async () => {
+  // NOTE: this exercises the lost-response retry with a SINGLE in-memory cache
+  // shared across two createApp() instances in THIS process. Closing appA and
+  // opening appB does NOT clear module-level state and is NOT an OS-process
+  // restart; the genuine cross-process restart is covered by the child-process
+  // test in tests/restart.test.mjs. Here we verify the DB-backed retry path.
   const appA = createApp(); await new Promise(r => appA.listen(0, '127.0.0.1', r));
   const baseA = 'http://127.0.0.1:' + appA.address().port;
   const postA = (route, data) => fetch(baseA + route, { method: 'POST', headers: { Origin: baseA, 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
@@ -276,13 +283,15 @@ test('Round 3 Finding 3: HTTP lost first-save response -> actual server restart 
     // Confirm the draft was consumed (promoted).
     assert.equal(await getDraft(draftId), null, 'draft consumed on first save');
   } finally {
-    // "Lost response": the client never learned the interview id. Shut down A —
-    // an ACTUAL restart: all in-memory tokens are gone.
+    // "Lost response": the client never learned the interview id. Close appA.
+    // (Same-process: module-level in-memory caches are NOT cleared by this; the
+    // DB-backed idempotency path is what makes the retry succeed. See the
+    // child-process restart test for genuine cross-process behaviour.)
     await new Promise(r => appA.close(r));
   }
 
-  // Process B: brand-new server (empty in-memory cache). Client retries the SAME
-  // first save (same idempotencyKey) with the now-stale draftId and no token.
+  // appB: a second in-process server instance. Client retries the SAME first save
+  // (same idempotencyKey) with the now-stale draftId and no token.
   const appB = createApp(); await new Promise(r => appB.listen(0, '127.0.0.1', r));
   const baseB = 'http://127.0.0.1:' + appB.address().port;
   const postB = (route, data) => fetch(baseB + route, { method: 'POST', headers: { Origin: baseB, 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
@@ -300,4 +309,74 @@ test('Round 3 Finding 3: HTTP lost first-save response -> actual server restart 
     assert.equal((await listInterviews()).filter(i => i.id === firstInterviewId).length, 1, 'exactly one interview');
     assert.equal((await openInterview(firstInterviewId)).runs.length, 1, 'exactly one run');
   } finally { await new Promise(r => appB.close(r)); }
+});
+
+test('Round 5: payload-consistent idempotency — changed retry conflicts, edits not discarded; identical retry replays', async () => {
+  const app = createApp(); await new Promise(r => app.listen(0, '127.0.0.1', r));
+  const base = 'http://127.0.0.1:' + app.address().port;
+  const post = (route, data) => fetch(base + route, { method: 'POST', headers: { Origin: base, 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
+  try {
+    const snap = await (await post('/api/resolve', { url: 'https://github.com/GongqiLinVU/milestoneproject', demo: true })).json();
+    const prepared = await (await post('/api/analyse', { snapshotId: snap.id, paths: ['README.md'], focus: 'payload consistency', history: '' })).json();
+    const qid = prepared.analysis.questions[0].qid;
+    const key = 'payload-' + Date.now();
+
+    // First save commits the original answer.
+    const first = await post('/api/save', {
+      draftId: prepared.draftId, idempotencyKey: key, title: 'Payload', focus: 'payload consistency', history: '',
+      responses: [{ questionId: qid, studentSelfReport: 'ORIGINAL answer' }]
+    });
+    assert.equal(first.status, 200);
+    const firstBody = await first.json();
+    const interviewId = firstBody.interview.id;
+
+    // IDENTICAL retry (same key, same content) -> replays the committed record.
+    const identical = await post('/api/save', {
+      draftId: prepared.draftId, idempotencyKey: key, title: 'Payload', focus: 'payload consistency', history: '',
+      responses: [{ questionId: qid, studentSelfReport: 'ORIGINAL answer' }]
+    });
+    assert.equal(identical.status, 200, 'identical retry replays');
+    assert.equal((await identical.json()).interview.id, interviewId, 'same interview, no duplicate');
+
+    // CHANGED retry: the teacher edited the answer after the (lost) response and
+    // retries with the SAME key. Must return a conflict, NOT a false Saved, and
+    // must NOT discard/overwrite the edit.
+    const changed = await post('/api/save', {
+      draftId: prepared.draftId, idempotencyKey: key, title: 'Payload', focus: 'payload consistency', history: '',
+      responses: [{ questionId: qid, studentSelfReport: 'EDITED answer the teacher wants to keep' }]
+    });
+    assert.equal(changed.status, 409, 'changed retry is a conflict, not a silent success');
+    const changedBody = await changed.json();
+    assert.match(changedBody.error, /different content|NOT saved/i, 'clear conflict message');
+
+    // The committed record is unchanged (still the ORIGINAL), and there is exactly
+    // one interview and one run — no duplicate, no silent overwrite.
+    const opened = await (await post('/api/open', { interviewId })).json();
+    assert.equal(opened.selectedRun.responses[0].studentSelfReport, 'ORIGINAL answer', 'committed record unchanged by the conflicting retry');
+    assert.equal((await listInterviews()).filter(i => i.id === interviewId).length, 1, 'no duplicate interview');
+    assert.equal(opened.runs.length, 1, 'no duplicate run');
+
+    // Recovery path: reopen the committed record and save the edit as an explicit
+    // version-checked update. This succeeds and applies the new answer.
+    const upd = await post('/api/save', {
+      interviewId, expectedVersion: opened.interview.version, runId: opened.selectedRun.id,
+      title: 'Payload', focus: 'payload consistency', history: '',
+      responses: [{ questionId: qid, studentSelfReport: 'EDITED answer the teacher wants to keep' }]
+    });
+    assert.equal(upd.status, 200, 'explicit version-checked update applies the edit');
+    assert.equal((await upd.json()).selectedRun.responses[0].studentSelfReport, 'EDITED answer the teacher wants to keep');
+  } finally { await new Promise(r => app.close(r)); }
+});
+
+test('Round 5: requestFingerprint is stable, order-independent for responses, and content-sensitive', () => {
+  const base = { title: 'T', focus: 'F', history: 'H', teacherReview: 'R', responses: [
+    { questionId: 'q1', editedQuestion: '', studentSelfReport: 'a', teacherVerification: '' },
+    { questionId: 'q2', editedQuestion: '', studentSelfReport: 'b', teacherVerification: '' }
+  ] };
+  const reordered = { ...base, responses: [base.responses[1], base.responses[0]] };
+  assert.equal(requestFingerprint(base), requestFingerprint(reordered), 'response order does not matter');
+  const changed = { ...base, responses: [base.responses[0], { ...base.responses[1], studentSelfReport: 'B!' }] };
+  assert.notEqual(requestFingerprint(base), requestFingerprint(changed), 'a changed answer changes the fingerprint');
+  const titleChanged = { ...base, title: 'T2' };
+  assert.notEqual(requestFingerprint(base), requestFingerprint(titleChanged), 'a changed title changes the fingerprint');
 });

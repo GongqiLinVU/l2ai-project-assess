@@ -187,16 +187,18 @@ destructive drop-and-recreate into a data-preserving, transactional upgrade.
 | --- | --- | --- | --- | --- |
 | 1 | The evidence migration was destructive and only tested on a clean database. | Migration 2 now upgrades in place inside a transaction: it archives all legacy evidence verbatim into `evidence_snapshot_legacy`, re-keys `evidence_snapshot` to `analysis_run_id`, and backfills legacy evidence onto a run **only when the interview has exactly one run** (unambiguous). If any interview with legacy evidence has more than one run it **RAISES and rolls back**, naming the interviews; evidence with no run is left only in the archive with a `notice`. | `npm run test:migrate`: (a) populated v0.2 unambiguous DB keeps interview/run/answers and re-binds evidence to the run, archive retained; (b) populated v0.2 ambiguous DB (legacy evidence + 2 runs) raises `Ambiguous legacy evidence mapping`, rolls back, old schema + all data intact, no new tables. Also exercised manually against two throwaway DBs. | **Passed** |
 | 2 | `createDraft` failures were swallowed; a memory-only prep was presented as restart-safe. | `/api/analyse` now reports `draftPersisted` and, on failure, `draftError`; it keeps the in-memory token (so the prepared analysis is not lost) but clearly marks the prep as NOT restart-safe. The UI shows the warning as an error status. | `npm run test:db` "a draft-write failure is surfaced, not swallowed": with `analysis_draft` temporarily removed, `/api/analyse` returns `draftPersisted:false`, a clear `draftError`, `draftId:null`, and still returns the analysis + a usable token; an immediate token save then succeeds. | **Passed** |
-| 3 | First-save retries failed after draft promotion + restart (duplicate risk / draft-expired error). | `handleSave` resolves an already-committed `idempotencyKey` to the existing interview/run **before** requiring a live token or unconsumed draft (`findInterviewByIdempotencyKey`). The create path still dedupes inside the transaction, so no duplicate interview or run is created. | `npm run test:db`: (a) db-layer resolves a committed key to the same interview/run with the answer preserved; (b) HTTP lost-response across **two separate server processes** (actual restart) — retry with the same key + stale `draftId` returns the ORIGINAL interview/run, answer preserved, exactly one interview and one run. | **Passed** |
+| 3 | First-save retries failed after draft promotion + restart (duplicate risk / draft-expired error). | `handleSave` resolves an already-committed `idempotencyKey` to the existing interview/run **before** requiring a live token or unconsumed draft (`findInterviewByIdempotencyKey`). The create path still dedupes inside the transaction, so no duplicate interview or run is created. | `npm run test:db`: (a) db-layer resolves a committed key to the same interview/run with the answer preserved; (b) HTTP lost-response retry with the same key + stale `draftId` returns the ORIGINAL interview/run, answer preserved, exactly one interview and one run. **Correction:** this HTTP check runs two `createApp()` instances in ONE process, which is **not** an OS-process restart; the follow-up round below relabels it and adds a genuine child-process restart test. A further gap — changed-content retries silently returned the old record — is also fixed in the follow-up round. | **Passed (superseded)** |
 
-### Page reload vs actual server restart (unchanged distinction, re-verified)
+### Page reload vs server restart (corrected in the follow-up round)
 
 - **Page reload** — the tab refreshes; the server keeps running and its in-memory
   token still exists (persistence browser walkthrough).
-- **Actual server restart** — a new Node process with empty in-memory state. The
-  first-save retry test (Finding 3b) now exercises this directly with two separate
-  `createApp()` server instances: process A commits the first save and is closed;
-  process B serves the retry purely from the committed idempotency key.
+- **Server restart** — a new Node process with empty in-memory state. **Correction:**
+  the earlier Finding 3b HTTP check used two `createApp()` instances in the SAME
+  process (module-level caches were not cleared), so it did not demonstrate an
+  OS-process restart. The follow-up round adds `tests/restart.test.mjs`, which
+  spawns the server as a child process, hard-kills it after the first save, and
+  retries from a fresh process — a genuine cross-process restart.
 
 ### Recovery notes — if the earlier DESTRUCTIVE migration was already applied
 
@@ -248,3 +250,51 @@ temporary symlink removed afterwards) and the cached official Chrome for Testing
 - Recovery option 1/2 for a populated destructively-migrated database is documented,
   not executed, because no such populated database exists locally (the only affected
   database was verified empty).
+
+---
+
+## Payload-consistent first-save retry + restart-claim correction (1 November 2026, Melbourne)
+
+One follow-up finding on commit `9e1aa8a` (`feat/local-persistence`): the idempotency
+lookup returned the stored record for any request with the same key, even when the
+teacher-editable content had changed. After a lost save response a teacher could edit
+an answer and retry; the UI then replaced those edits with the old record and showed
+*Saved*. The restart claim in the previous round was also inaccurate.
+
+Migration `20261031000003_idempotency_fingerprint.sql` adds a nullable
+`interview.request_fingerprint` (SHA-256 of title, focus, history, teacher review and
+the normalised responses), captured at first save so comparison survives a restart.
+
+### Fix and checks
+
+| Area | Fix | Check | Result |
+| --- | --- | --- | --- |
+| Payload-consistent idempotency | `/api/save` computes the request fingerprint and compares it to the one stored under the idempotency key. Identical retry → replays the committed interview/run (200). Changed retry → `409` conflict; the record is **not** returned and nothing is overwritten. The transactional `saveInterview` repeats the same check as a race guard. A legacy row with no stored fingerprint still replays (back-compatible). | `npm run test:db` "payload-consistent idempotency": first save commits "ORIGINAL"; identical retry replays same interview; changed retry → `409` with a clear message; the committed record stays "ORIGINAL"; one interview, one run; then an explicit version-checked update applies the edit. Plus a fingerprint unit check (order-independent for responses, content-sensitive). | **Passed** |
+| No false *Saved*, edits kept (UI) | The client reuses one idempotency key across retries (so no duplicate), shows *Conflict* on `409`, and does not call `applySaved`, so the form keeps the teacher's edits. | `tests/browser-persistence.mjs` new scenario: the first `/api/save` response is dropped (server still commits); the teacher edits the answer and retries; the save-state becomes *Conflict* (asserted **not** *Saved*), the edited answer remains in `#a0`, and exactly one interview exists. | **Passed** |
+| No duplicate create on retry | Retries reuse the committed idempotency key; the create path dedupes in-transaction. | Covered by the db and browser checks above and the cross-process test below (exactly one interview / one run after each retry). | **Passed** |
+| Restart claim corrected | Relabelled the same-process `test:db` case; added a genuine child-process restart test. | `npm run test:restart`: spawns the server as a child OS process (distinct pid), first-saves, `SIGKILL`s it, spawns a fresh process, and retries — identical retry returns the ORIGINAL interview/run (one interview), and a payload-changed retry returns `409` with the committed record unchanged. | **Passed** |
+
+### Commands run (this round)
+
+```bash
+npm test            # 5/5 core tests pass (no DB)
+npm run test:db     # 17/17 pass (adds payload-consistent idempotency + fingerprint unit; same-process retry relabelled)
+npm run test:migrate# 2/2 populated-database upgrade tests pass (unaffected by the new nullable column)
+npm run test:restart# 1/1 genuine cross-process (child process spawn + SIGKILL + fresh process) retry test passes
+npm run test:ui     # core browser walkthrough: PASS
+node --env-file-if-exists=.env.test tests/browser-persistence.mjs   # persistence walkthrough incl. lost-response payload-consistent retry: PASS
+```
+
+Migration `20261031000003` was applied to the local dev database and the disposable
+test database was rebuilt from all three migrations. Browser runs used Playwright
+`1.64.1` installed outside the project (`--no-save`, temporary symlink removed
+afterwards) and the cached official Chrome for Testing build.
+
+### Scope and not-run
+
+- Scope limited to the first-save retry fix, the restart-claim correction, and their
+  tests/docs. No unrelated behaviour changed.
+- No hosted Supabase, deployment, remote database operation, or paid model call.
+- `LIVE_GITHUB=1` was not run; the offline pinned fixture was used throughout.
+- The recovery guidance for a populated destructively-migrated database remains
+  documented, not executed (no such database exists locally).
